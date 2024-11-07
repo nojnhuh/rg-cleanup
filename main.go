@@ -13,7 +13,10 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization/v2"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
+	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
+	"github.com/microsoftgraph/msgraph-sdk-go/serviceprincipals"
 )
 
 const (
@@ -40,14 +43,15 @@ var rfc3339Layouts = []string{
 }
 
 type options struct {
-	clientID       string
-	clientSecret   string
-	tenantID       string
-	subscriptionID string
-	dryRun         bool
-	ttl            time.Duration
-	identity       bool
-	regex          string
+	clientID        string
+	clientSecret    string
+	tenantID        string
+	subscriptionID  string
+	dryRun          bool
+	ttl             time.Duration
+	identity        bool
+	regex           string
+	roleAssignments bool
 }
 
 func (o *options) validate() error {
@@ -79,11 +83,14 @@ func defineOptions() *options {
 	flag.BoolVar(&o.identity, "identity", false, "Set to true if we should user-assigned identity for AUTH")
 	flag.DurationVar(&o.ttl, "ttl", defaultTTL, "The duration we allow resource groups to live before we consider them to be stale.")
 	flag.StringVar(&o.regex, "regex", defaultRegex, "Only delete resource groups matching regex")
+	flag.BoolVar(&o.roleAssignments, "role-assignments", false, "Set to true if we should delete role assignments assigned to principals which no longer exist")
 	flag.Parse()
 	return &o
 }
 
 func main() {
+	ctx := context.Background()
+
 	log.Println("Initializing rg-cleanup")
 
 	o := defineOptions()
@@ -96,19 +103,51 @@ func main() {
 		log.Println("Dry-run enabled - printing logs but not actually deleting resource groups")
 	}
 
-	r, err := getResourceGroupClient(o.clientID, o.clientSecret, o.tenantID, o.subscriptionID, o.identity)
+	options := arm.ClientOptions{
+		ClientOptions: azcore.ClientOptions{
+			Cloud: cloud.AzurePublic,
+		},
+	}
+
+	cred, err := getAzureCredential(o.clientID, o.clientSecret, o.tenantID, o.identity)
 	if err != nil {
 		log.Printf("Error when obtaining resource group client: %v", err)
 		panic(err)
 	}
 
-	if err := run(context.Background(), r, o.ttl, o.dryRun, o.regex); err != nil {
-		log.Printf("Error when running rg-cleanup: %v", err)
+	resourceGroupClient, err := armresources.NewResourceGroupsClient(o.subscriptionID, cred, &options)
+	if err != nil {
+		log.Printf("Error when obtaining resource group client: %v", err)
 		panic(err)
+	}
+
+	if err := runResourceGroupCleanup(ctx, resourceGroupClient, o.ttl, o.dryRun, o.regex); err != nil {
+		log.Printf("Error when cleaning up resource groups: %v", err)
+		panic(err)
+	}
+
+	if o.roleAssignments {
+		roleAssignmentClient, err := armauthorization.NewRoleAssignmentsClient(o.subscriptionID, cred, &options)
+		if err != nil {
+			log.Printf("Error when obtaining role assignment client: %v", err)
+			panic(err)
+		}
+
+		graph, err := msgraphsdk.NewGraphServiceClientWithCredentials(cred, []string{"https://graph.microsoft.com//.default"})
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if err := runRoleAssignmentCleanup(ctx, o.subscriptionID, roleAssignmentClient, graph, o.dryRun); err != nil {
+			log.Printf("Error when cleaning up role assignments: %v", err)
+			panic(err)
+		}
+	} else {
+		log.Println("Skipping role assignment cleanup")
 	}
 }
 
-func run(ctx context.Context, r *armresources.ResourceGroupsClient, ttl time.Duration, dryRun bool, regex string) error {
+func runResourceGroupCleanup(ctx context.Context, r *armresources.ResourceGroupsClient, ttl time.Duration, dryRun bool, regex string) error {
 	log.Println("Scanning for stale resource groups")
 
 	pager := r.NewListPager(nil)
@@ -193,12 +232,7 @@ func regexMatchesResourceGroupName(regex string, rgName string) (bool, error) {
 	return false, nil
 }
 
-func getResourceGroupClient(clientID, clientSecret, tenantID, subscriptionID string, identity bool) (*armresources.ResourceGroupsClient, error) {
-	options := arm.ClientOptions{
-		ClientOptions: azcore.ClientOptions{
-			Cloud: cloud.AzurePublic,
-		},
-	}
+func getAzureCredential(clientID, clientSecret, tenantID string, identity bool) (*azidentity.ChainedTokenCredential, error) {
 	possibleTokens := []azcore.TokenCredential{}
 	if identity {
 		micOptions := azidentity.ManagedIdentityCredentialOptions{
@@ -216,13 +250,95 @@ func getResourceGroupClient(clientID, clientSecret, tenantID, subscriptionID str
 		}
 		possibleTokens = append(possibleTokens, spCred)
 	}
-	chain, err := azidentity.NewChainedTokenCredential(possibleTokens, nil)
-	if err != nil {
-		return nil, err
+	return azidentity.NewChainedTokenCredential(possibleTokens, nil)
+}
+
+func runRoleAssignmentCleanup(ctx context.Context, subscriptionID string, roleAssignments *armauthorization.RoleAssignmentsClient, graph *msgraphsdk.GraphServiceClient, dryRun bool) error {
+	log.Println("Scanning for stale role assignments")
+
+	principalToAssignmentIDs := map[string][]string{}
+	filter := "atScope()" // ignore assignments scoped more narrowly than the subscription
+	pager := roleAssignments.NewListForSubscriptionPager(&armauthorization.RoleAssignmentsClientListForSubscriptionOptions{
+		Filter: &filter,
+	})
+	for pager.More() {
+		assignments, err := pager.NextPage(ctx)
+		if err != nil {
+			return err
+		}
+		for _, assignment := range assignments.Value {
+			if assignment.Properties.PrincipalType == nil || *assignment.Properties.PrincipalType != armauthorization.PrincipalTypeServicePrincipal {
+				continue
+			}
+			// The atScope() filter doesn't ignore assignments scoped more broadly than the subscription
+			if assignment.Properties.Scope == nil || *assignment.Properties.Scope != "/subscriptions/"+subscriptionID {
+				continue
+			}
+			if assignment.Properties.PrincipalID != nil && assignment.ID != nil {
+				pid := *assignment.Properties.PrincipalID
+				principalToAssignmentIDs[pid] = append(principalToAssignmentIDs[pid], *assignment.ID)
+			}
+		}
 	}
-	resourceGroupClient, err := armresources.NewResourceGroupsClient(subscriptionID, chain, &options)
-	if err != nil {
-		return nil, err
+	if len(principalToAssignmentIDs) == 0 {
+		log.Println("No role assignments found")
+		return nil
 	}
-	return resourceGroupClient, nil
+	principalIDs := make([]string, 0, len(principalToAssignmentIDs))
+	for k := range principalToAssignmentIDs {
+		principalIDs = append(principalIDs, k)
+	}
+
+	exisitngIDs := map[string]struct{}{}
+
+	// Only 1000 IDs can be requested at a time
+	batchSize := 1000
+	for i := 0; i*batchSize < len(principalIDs); i++ {
+		lo := i * batchSize
+		hi := lo + batchSize
+		if hi > len(principalIDs) {
+			hi = len(principalIDs)
+		}
+		window := principalIDs[lo:hi]
+
+		idReq := serviceprincipals.NewGetByIdsPostRequestBody()
+		idReq.SetIds(window)
+		idRes, err := graph.ServicePrincipals().GetByIds().PostAsGetByIdsPostResponse(ctx, idReq, &serviceprincipals.GetByIdsRequestBuilderPostRequestConfiguration{})
+		if err != nil {
+			return fmt.Errorf("error querying graph: %w", err)
+		}
+
+		for _, id := range idRes.GetValue() {
+			if id.GetId() != nil {
+				exisitngIDs[*id.GetId()] = struct{}{}
+			}
+		}
+	}
+
+	for _, id := range principalIDs {
+		if _, exists := exisitngIDs[id]; exists {
+			delete(principalToAssignmentIDs, id)
+		}
+	}
+
+	if len(principalToAssignmentIDs) == 0 {
+		log.Printf("All principals assigned roles exist, deleting no role assignments")
+		return nil
+	}
+
+	for _, assignments := range principalToAssignmentIDs {
+		for _, assignment := range assignments {
+			if dryRun {
+				log.Printf("Dry-run: skip deletion of eligible role assignment %s", assignment)
+				continue
+			}
+			_, err := roleAssignments.DeleteByID(ctx, assignment, nil)
+			if err != nil {
+				return fmt.Errorf("failed to delete role assignment %s: %w", assignment, err)
+			}
+			log.Printf("Deleted role assignment %s", assignment)
+		}
+	}
+
+	return nil
 }
